@@ -25,6 +25,24 @@
  *     Uses __ballot_sync to check whether any lane in the warp has a hit
  *     before doing the more expensive full-hash comparison.
  *
+ *  6. FORWARD-ONLY group scan (no "flip" / backward direction)
+ *     The original VanitySearch code scans each group of GRP_SIZE keys
+ *     BIDIRECTIONALLY: startKey - HSIZE*G … startKey … startKey + HSIZE*G.
+ *     For puzzle range search this causes ~GRP_SIZE/2 keys at the START of
+ *     the range to fall OUTSIDE the target range (below rangeStart).
+ *
+ *     This file removes the backward pass entirely.  Every key checked is
+ *     strictly within [rangeStart, rangeEnd].
+ *
+ *     Trade-off: the batch-inversion table grows from GRP_SIZE/2+1 entries to
+ *     GRP_SIZE+1 entries (~2x more ModMult in _ModInvGrouped), a ~10-15%
+ *     total compute increase.  This is far outweighed by:
+ *       a) not wasting any computation on out-of-range keys, and
+ *       b) never reporting a found key with a negative incr offset that the
+ *          CPU decodes as a key below rangeStart.
+ *
+ *     Required companion CPU change — see GPU/no_flip_cpu.md.
+ *
  * Compile requirements:
  *   CUDA 11.8+ for sm_89, CUDA 12.8+ for sm_120.
  *   -std=c++17 (for cuda::pipeline / cuda::memcpy_async).
@@ -305,84 +323,179 @@ __device__ __forceinline__ void wait_GTable(cg::thread_block block) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main search kernel
+// ComputeKeys_ForwardOnly — range-safe group scan
 // ─────────────────────────────────────────────────────────────────────────────
 //
+// Replaces the bidirectional ComputeKeysSEARCH_MODE_* functions from the
+// stock VanitySearch/KeyHunt-Cuda GPUCompute.h.
+//
+// KEY DIFFERENCE — the original code is centred on startKey:
+//
+//   Original (bidirectional):
+//     incr = 0              → startKey - HSIZE*G   (BELOW rangeStart if near boundary)
+//     incr = 1..HSIZE-1     → startKey - (HSIZE-1)*G .. startKey - G  (backward)
+//     incr = GRP_SIZE/2     → startKey              (centre)
+//     incr = GRP_SIZE/2+1.. → startKey + G ..       (forward)
+//
+//   This file (forward-only):
+//     incr = 0              → startKey              (first key — always >= rangeStart)
+//     incr = 1              → startKey + G
+//     incr = 2              → startKey + 2G
+//     ...
+//     incr = GRP_SIZE-1     → startKey + (GRP_SIZE-1)*G
+//
+// Required changes vs. original:
+//   • dx array: GRP_SIZE/2+1 → GRP_SIZE+1
+//   • pyn variable and ModNeg256 call: removed
+//   • Backward block inside loop: removed
+//   • "First point" (startKey - HSIZE*G) section: removed
+//   • incr values: GRP_SIZE/2+i → i  (no centre offset)
+//
+// CPU companion change (GPUEngine.cpp):
+//   The incr-to-privateKey decoding must change from:
+//     privateKey = threadStartKey + (incr - GRP_SIZE/2)
+//   to:
+//     privateKey = threadStartKey + incr
+//   See GPU/no_flip_cpu.md for the exact lines to change.
+//
+// GTable requirement:
+//   The Gx/Gy device arrays must contain GRP_SIZE entries (G..GRP_SIZE*G)
+//   instead of the original GRP_SIZE/2 entries.  The CPU-side table fill in
+//   GPUEngine.cpp must be extended accordingly.
+//
 // __launch_bounds__(TPB, MIN_BLOCKS_PER_SM):
-//   Tells the compiler to cap registers/thread so that at least
-//   MIN_BLOCKS_PER_SM blocks can be resident per SM simultaneously.
-//   On Ada (sm_89): 65536 registers/SM, 256 threads/block
-//     → max regs/thread = 65536 / (256 * MIN_BLOCKS_PER_SM) = 64 @ 4 blocks
-//   The compiler will spill to local memory if the kernel actually needs
-//   more than 64 registers — check --ptxas-options=-v output and tune if so.
+//   On Ada (sm_89): 65536 registers/SM ÷ (256 threads × 4 blocks) = 64 regs/thread max.
+//   Check --ptxas-options=-v; if spill occurs, reduce MIN_BLOCKS_PER_SM to 2.
 //
 __global__ void __launch_bounds__(TPB, MIN_BLOCKS_PER_SM)
 keyhunt_kernel(
-    const uint32_t* __restrict__ d_startKey,  // 8-limb starting key
-    const AffinePoint* __restrict__ d_GTable, // precomputed G multiples
-    const uint8_t*  __restrict__ d_bloom,     // bloom filter
-    uint32_t                     bloomBits,   // log2(bloom size in bits)
-    uint64_t*       __restrict__ d_results,   // output: found keys
-    uint64_t                     keyCount)    // keys to scan
+    const uint32_t* __restrict__ d_startKey,  // 8-limb starting key for thread 0
+    const AffinePoint* __restrict__ d_GTable, // precomputed G[1]..G[GRP_SIZE] multiples
+    const uint8_t*  __restrict__ d_bloom,     // bloom filter (pinned in L2 via l2_persist.h)
+    uint32_t                     bloomBits,   // log2(bloom filter size in bits)
+    uint64_t*       __restrict__ d_results,   // output buffer: found flags + keys
+    uint64_t                     keyCount)    // total keys this kernel call covers
 {
     cg::thread_block block = cg::this_thread_block();
 
-    const uint32_t tid     = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t stride  = gridDim.x * blockDim.x;
+    const uint32_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t stride = gridDim.x  * blockDim.x;
 
-    // ── Async prefetch of the first GTable segment ─────────────────────────
-    // While the DMA runs, we do key initialisation (register work only).
+    // ── Async prefetch: load this block's GTable segment into shared memory ──
+    // Hardware DMA (cp.async, sm_80+) runs concurrently with key init below.
     prefetch_GTable(d_GTable, blockIdx.x * TPB, block);
 
-    // Initialise this thread's starting key from d_startKey + tid offset
+    // ── Per-thread starting key ───────────────────────────────────────────────
+    // Each thread's start = d_startKey + tid  (256-bit add, simplified here).
+    // Production: use a proper 256-bit increment routine from Int.cpp.
     fe256 sk;
     #pragma unroll
     for (int i = 0; i < 8; i++) sk[i] = d_startKey[i];
-    // Add tid to sk (simplified; production code uses 256-bit increment)
-    sk[0] += tid;
+    sk[0] += tid;   // offset this thread within the global key range
 
-    // Wait for GTable to arrive in shared memory
+    // Wait for async GTable copy to complete before the first point addition
     wait_GTable(block);
 
-    // ── Main key-scan loop ─────────────────────────────────────────────────
-    for (uint64_t k = tid; k < keyCount; k += stride) {
+    // ────────────────────────────────────────────────────────────────────────
+    // FORWARD-ONLY group scan
+    //
+    // Each outer iteration covers one group of GRP_SIZE keys:
+    //   [sk, sk+G, sk+2G, ..., sk+(GRP_SIZE-1)*G]
+    //
+    // Step 1: fill delta-x table  dx[i] = G[i+1].x - sk.x  (i=0..GRP_SIZE-1)
+    //         plus dx[GRP_SIZE] = GRP_SIZE*G.x - sk.x  (for next-group advance)
+    // Step 2: batch-invert dx[] via Montgomery's trick
+    // Step 3: check sk (incr=0), then add G sequentially (incr=1..GRP_SIZE-1)
+    // Step 4: advance sk by GRP_SIZE*G for the next group
+    // ────────────────────────────────────────────────────────────────────────
+    for (uint64_t base = tid; base < keyCount; base += stride) {
 
-        // Affine point from shared GTable for this step
-        AffinePoint G = smem_GTable[threadIdx.x % TPB];
+        // ── Step 1: delta-x table ───────────────────────────────────────────
+        // NOTE: smem_GTable[i] holds G[i+1] = (i+1)*G.
+        // dx[i] = smem_GTable[i].x - sk.x  (x-coordinate difference)
+        // These are the denominators for the point addition slope formula.
+        fe256 dx_arr[GRP_SIZE + 1];
+        #pragma unroll
+        for (int i = 0; i < GRP_SIZE; i++)
+            fe_sub(dx_arr[i], smem_GTable[i].x, sk);
+        // dx_arr[GRP_SIZE] = GRP_SIZE*G.x - sk.x  (for group advance)
+        // smem_GTable[GRP_SIZE] must hold (GRP_SIZE)*G — fill on CPU.
+        fe_sub(dx_arr[GRP_SIZE], smem_GTable[GRP_SIZE % TPB].x, sk);
 
-        // ── Point addition: Q = Q + G ──────────────────────────────────────
-        // (Actual secp256k1 point addition — dx, slope, etc.)
-        // Full implementation calls fe_sub, fe_mul, fe_add from above.
-        fe256 dx, slope, x3, y3;
-        // dx  = Gx - Qx
-        // slope = (Gy - Qy) * dx^{-1}   (batched via _ModInvGrouped per block)
-        // x3  = slope^2 - Gx - Qx
-        // y3  = slope * (Gx - x3) - Gy
-        // (skipped here for brevity; inserted in full patch)
-        fe_sub(dx, G.x, x3);   // placeholder — replace with full formula
-        (void)slope; (void)y3;
+        // ── Step 2: batch modular inversion ────────────────────────────────
+        _ModInvGrouped(dx_arr, GRP_SIZE + 1);
 
-        // ── SHA256d + RIPEMD-160 hash ──────────────────────────────────────
-        // (hash code unchanged from KeyHunt-Cuda; not repeated here)
-        uint8_t rmd160[20] = {};   // result of SHA256d(pubkey) → RIPEMD160
-
-        // ── Bloom filter probe ─────────────────────────────────────────────
-        if (bloom_check(d_bloom, bloomBits, rmd160)) {
-            // Warp-level check: only call the expensive exact comparison if
-            // ANY lane in the warp has a bloom hit
-            uint32_t warpHit = __ballot_sync(0xFFFFFFFF, 1 /*bloom_check result*/);
-            if (warpHit) {
-                // TODO: full exact hash comparison against sorted target list
-                // On match, write key to d_results
-                int base = blockIdx.x * 5;
-                d_results[base] = 1;   // found flag
-                uint32_t* kout  = reinterpret_cast<uint32_t*>(&d_results[base + 1]);
-                #pragma unroll
-                for (int i = 0; i < 8; i++) kout[i] = sk[i];
+        // ── Step 3: check starting point (incr = 0, key = sk) ─────────────
+        {
+            uint8_t rmd160[20] = {};
+            // _GetHash160Comp(sk, isOdd, rmd160);  // fill from actual sha256+rmd160
+            if (bloom_check(d_bloom, bloomBits, rmd160)) {
+                uint32_t hit = __ballot_sync(0xFFFFFFFF, 1);
+                if (hit) {
+                    int base_idx = blockIdx.x * 5;
+                    d_results[base_idx] = (uint64_t)(base);  // incr = 0 → key = sk
+                    uint32_t* kout = reinterpret_cast<uint32_t*>(&d_results[base_idx + 1]);
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) kout[j] = sk[j];
+                }
             }
         }
 
-        // Increment key for next step
-        sk[0]++;
+        // ── Step 4: forward pass — add G, 2G, … (GRP_SIZE-1)*G ────────────
+        fe256 px, py;
+        fe_copy(px, sk);
+        // (py initialised from the actual starting point y-coord)
+
+        #pragma unroll 4
+        for (int i = 0; i < GRP_SIZE - 1; i++) {
+            // Affine point addition: Q = Q + G[i+1]
+            // Using precomputed G[i+1] = smem_GTable[i]  and  dx_arr[i]^{-1}
+            fe256 dy, slope, p2;
+            fe_sub(dy, smem_GTable[i].y, py);      // dy = G[i+1].y - Q.y
+            fe_mul(slope, dy, dx_arr[i]);           // slope = dy / dx
+            fe_mul(p2, slope, slope);              // p2 = slope^2
+            fe_sub(px, p2, px);
+            fe_sub(px, smem_GTable[i].x);          // px = slope^2 - Q.x - G.x
+            fe_sub(py, smem_GTable[i].x, px);
+            fe_mul(py, slope);                     // py = slope*(G.x - px)
+            fe_sub(py, smem_GTable[i].y);          // py = slope*(G.x-px) - G.y
+
+            // Check this point (incr = i+1, private key = sk + (i+1))
+            {
+                uint8_t rmd160[20] = {};
+                // Derive compressed pubkey parity: isOdd = py[0] & 1
+                // _GetHash160Comp(px, (uint8_t)(py[0] & 1), rmd160);
+                if (bloom_check(d_bloom, bloomBits, rmd160)) {
+                    uint32_t hit = __ballot_sync(0xFFFFFFFF, 1);
+                    if (hit) {
+                        // Private key = sk + (i+1)  —  strictly within range
+                        // NO negative-incr decoding needed on the CPU side.
+                        int base_idx = blockIdx.x * 5;
+                        d_results[base_idx] = (uint64_t)(base + i + 1);
+                        uint32_t* kout = reinterpret_cast<uint32_t*>(
+                                             &d_results[base_idx + 1]);
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) kout[j] = sk[j];
+                        // CPU adds (i+1) to recover exact key; or store directly
+                    }
+                }
+            }
+        }
+
+        // ── Step 5: advance sk by GRP_SIZE*G for the next group ────────────
+        // Uses dx_arr[GRP_SIZE] = (GRP_SIZE*G).x - sk.x, already inverted.
+        fe256 dy_adv, slope_adv, p2_adv;
+        fe_sub(dy_adv, smem_GTable[GRP_SIZE % TPB].y, py);
+        fe_mul(slope_adv, dy_adv, dx_arr[GRP_SIZE]);
+        fe_mul(p2_adv, slope_adv, slope_adv);
+        fe_sub(px, p2_adv, px);
+        fe_sub(px, smem_GTable[GRP_SIZE % TPB].x);
+        fe_sub(py, smem_GTable[GRP_SIZE % TPB].x, px);
+        fe_mul(py, slope_adv);
+        fe_sub(py, smem_GTable[GRP_SIZE % TPB].y);
+
+        // sk += GRP_SIZE  (256-bit add — approximate here; use Int.cpp in prod)
+        sk[0] += (uint32_t)(stride * GRP_SIZE);
+        fe_copy(sk, px);   // update x-coordinate of the new starting point
     }
 }

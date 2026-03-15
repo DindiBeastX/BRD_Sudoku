@@ -1,0 +1,283 @@
+--- a/GPU/GPUCompute.h
++++ b/GPU/GPUCompute.h
+@@ -372,14 +372,14 @@ __device__ void ComputeKeysSEARCH_MODE_MA(uint32_t mode, uint64_t* startx, uint
+ {
+
+-	uint64_t dx[GRP_SIZE / 2 + 1][4];
++	uint64_t dx[GRP_SIZE + 1][4];     // needs GRP_SIZE entries for forward + 1 for next-centre
+ 	uint64_t px[4];
+ 	uint64_t py[4];
+-	uint64_t pyn[4];                  // removed: negated-y no longer needed
+ 	uint64_t sx[4];
+ 	uint64_t sy[4];
+ 	uint64_t dy[4];
+ 	uint64_t _s[4];
+ 	uint64_t _p2[4];
+
+@@ -390,63 +390,53 @@ __device__ void ComputeKeysSEARCH_MODE_MA(uint32_t mode, uint64_t* startx, uint
+ 	Load256(px, sx);
+ 	Load256(py, sy);
+
+-	// Fill GRP_SIZE/2+1 delta-x values (shared for ±i*G via symmetry)
++	// Fill GRP_SIZE+1 delta-x values: one per forward step + one for next-centre advance
+ 	uint32_t i;
+-	for (i = 0; i < HSIZE; i++)
++	for (i = 0; i < GRP_SIZE; i++)
+ 		ModSub256(dx[i], Gx + 4 * i, sx);
+-	ModSub256(dx[i], Gx + 4 * i, sx);   // for the first point (startP - HSIZE*G)
+-	ModSub256(dx[i + 1], _2Gnx, sx);    // for the next-centre advancement
++	ModSub256(dx[i], _2Gnx, sx);         // dx[GRP_SIZE]: next-centre advancement
+
+ 	// Compute modular inverse of all delta-x values in one batch
+ 	_ModInvGrouped(dx);
+
+-	// Bidirectional scan: P+i*G and P-i*G share the same delta-x inverse.
+-	// Centre of the group = startKey (incr = GRP_SIZE/2).
+-	// PROBLEM for range search: incr < GRP_SIZE/2 → key < startKey → may be < rangeStart.
++	// FORWARD-ONLY scan: keys startKey, startKey+G, ..., startKey+(GRP_SIZE-1)*G
++	// All incr values are 0 … GRP_SIZE-1 — strictly within [rangeStart, rangeEnd].
+
+-	// Check starting point (centre)
+-	CHECK_HASH_SEARCH_MODE_MA(GRP_SIZE / 2);
++	// Check starting point (incr = 0 → key = startKey)
++	CHECK_HASH_SEARCH_MODE_MA(0);
+
+-	ModNeg256(pyn, py);                  // pyn = -py  (for P - i*G steps)
+-
+-	for (i = 0; i < HSIZE; i++) {
++	for (i = 0; i < GRP_SIZE - 1; i++) {
+
+-		// P = StartPoint + i*G  (forward)
++		// P = StartPoint + (i+1)*G
+ 		Load256(px, sx);
+ 		Load256(py, sy);
+ 		ModSub256(dy, Gy + 4 * i, py);
+
+ 		_ModMult(_s, dy, dx[i]);
+ 		_ModSqr(_p2, _s);
+
+ 		ModSub256(px, _p2, px);
+ 		ModSub256(px, Gx + 4 * i);
+
+ 		ModSub256(py, Gx + 4 * i, px);
+ 		_ModMult(py, _s);
+ 		ModSub256(py, Gy + 4 * i);
+
+-		CHECK_HASH_SEARCH_MODE_MA(GRP_SIZE / 2 + (i + 1));
+-
+-		// ──────────────────────────────────────────────────────────────────
+-		// REMOVED: P = StartPoint - i*G  (backward / "flip")
+-		// This block computed keys BELOW startKey which may be outside the
+-		// puzzle range when startKey is near rangeStart.
+-		//
+-		// Load256(px, sx);
+-		// ModSub256(dy, pyn, Gy + 4 * i);
+-		// _ModMult(_s, dy, dx[i]);
+-		// _ModSqr(_p2, _s);
+-		// ModSub256(px, _p2, px);
+-		// ModSub256(px, Gx + 4 * i);
+-		// ModSub256(py, px, Gx + 4 * i);
+-		// _ModMult(py, _s);
+-		// ModSub256(py, Gy + 4 * i, py);
+-		// CHECK_HASH_SEARCH_MODE_MA(GRP_SIZE / 2 - (i + 1));
+-		// ──────────────────────────────────────────────────────────────────
+-
++		CHECK_HASH_SEARCH_MODE_MA(i + 1);
+ 	}
+
+-	// ──────────────────────────────────────────────────────────────────────
+-	// REMOVED: "First point" section (startP - HSIZE*G, incr = 0)
+-	// This was the most-negative key in the group — most likely outside range.
+-	//
+-	// Load256(px, sx); Load256(py, sy);
+-	// ModNeg256(dy, Gy + 4 * i); ModSub256(dy, py);
+-	// _ModMult(_s, dy, dx[i]);   _ModSqr(_p2, _s);
+-	// ModSub256(px, _p2, px);    ModSub256(px, Gx + 4 * i);
+-	// ModSub256(py, px, Gx + 4 * i);
+-	// _ModMult(py, _s);          ModSub256(py, Gy + 4 * i, py);
+-	// CHECK_HASH_SEARCH_MODE_MA(0);
+-	// ──────────────────────────────────────────────────────────────────────
+-
+-	i++;
++	i = GRP_SIZE;   // point dx[GRP_SIZE] at the next-centre entry
+
+ 	// Next start point (startP + GRP_SIZE*G)  — unchanged
+ 	Load256(px, sx);
+@@ -514,14 +504,14 @@ __device__ void ComputeKeysSEARCH_MODE_SA(uint32_t mode, uint64_t* startx, uint
+ {
+
+-	uint64_t dx[GRP_SIZE / 2 + 1][4];
++	uint64_t dx[GRP_SIZE + 1][4];
+ 	uint64_t px[4];
+ 	uint64_t py[4];
+-	uint64_t pyn[4];
+ 	uint64_t sx[4];
+ 	uint64_t sy[4];
+ 	uint64_t dy[4];
+ 	uint64_t _s[4];
+ 	uint64_t _p2[4];
+
+@@ -532,47 +522,36 @@ __device__ void ComputeKeysSEARCH_MODE_SA(uint32_t mode, uint64_t* startx, uint
+ 	Load256(px, sx);
+ 	Load256(py, sy);
+
+ 	uint32_t i;
+-	for (i = 0; i < HSIZE; i++)
++	for (i = 0; i < GRP_SIZE; i++)
+ 		ModSub256(dx[i], Gx + 4 * i, sx);
+-	ModSub256(dx[i], Gx + 4 * i, sx);
+-	ModSub256(dx[i + 1], _2Gnx, sx);
++	ModSub256(dx[i], _2Gnx, sx);
+ 	_ModInvGrouped(dx);
+
+-	CHECK_HASH_SEARCH_MODE_SA(GRP_SIZE / 2);
+-	ModNeg256(pyn, py);
+-
+-	for (i = 0; i < HSIZE; i++) {
++	CHECK_HASH_SEARCH_MODE_SA(0);
++	for (i = 0; i < GRP_SIZE - 1; i++) {
+ 		Load256(px, sx);
+ 		Load256(py, sy);
+ 		ModSub256(dy, Gy + 4 * i, py);
+ 		_ModMult(_s, dy, dx[i]);
+ 		_ModSqr(_p2, _s);
+ 		ModSub256(px, _p2, px);
+ 		ModSub256(px, Gx + 4 * i);
+ 		ModSub256(py, Gx + 4 * i, px);
+ 		_ModMult(py, _s);
+ 		ModSub256(py, Gy + 4 * i);
+-		CHECK_HASH_SEARCH_MODE_SA(GRP_SIZE / 2 + (i + 1));
+-
+-		// REMOVED backward block (P - i*G):
+-		// Load256(px, sx);
+-		// ModSub256(dy, pyn, Gy + 4 * i);
+-		// _ModMult(_s, dy, dx[i]); _ModSqr(_p2, _s);
+-		// ModSub256(px, _p2, px);  ModSub256(px, Gx + 4 * i);
+-		// ModSub256(py, px, Gx + 4 * i);
+-		// _ModMult(py, _s);        ModSub256(py, Gy + 4 * i, py);
+-		// CHECK_HASH_SEARCH_MODE_SA(GRP_SIZE / 2 - (i + 1));
++		CHECK_HASH_SEARCH_MODE_SA(i + 1);
+ 	}
+-	// REMOVED: first-point section (incr=0, key = startKey - HSIZE*G)
+-	i++;
++	i = GRP_SIZE;
+
+ 	// Next start point — unchanged
+@@ -640,14 +629,14 @@ __device__ void ComputeKeysSEARCH_MODE_MX(uint32_t mode, uint64_t* startx, uint
+ {
+
+-	uint64_t dx[GRP_SIZE / 2 + 1][4];
++	uint64_t dx[GRP_SIZE + 1][4];
+ 	uint64_t px[4];
+ 	uint64_t py[4];
+-	uint64_t pyn[4];
+ 	uint64_t sx[4];
+ 	uint64_t sy[4];
+ 	uint64_t dy[4];
+ 	uint64_t _s[4];
+ 	uint64_t _p2[4];
+
+@@ -658,47 +647,36 @@ __device__ void ComputeKeysSEARCH_MODE_MX(uint32_t mode, uint64_t* startx, uint
+ 	Load256(px, sx);
+ 	Load256(py, sy);
+
+ 	uint32_t i;
+-	for (i = 0; i < HSIZE; i++)
++	for (i = 0; i < GRP_SIZE; i++)
+ 		ModSub256(dx[i], Gx + 4 * i, sx);
+-	ModSub256(dx[i], Gx + 4 * i, sx);
+-	ModSub256(dx[i + 1], _2Gnx, sx);
++	ModSub256(dx[i], _2Gnx, sx);
+ 	_ModInvGrouped(dx);
+
+-	CHECK_PUB_SEARCH_MODE_MX(GRP_SIZE / 2);
+-	ModNeg256(pyn, py);
+-
+-	for (i = 0; i < HSIZE; i++) {
++	CHECK_PUB_SEARCH_MODE_MX(0);
++	for (i = 0; i < GRP_SIZE - 1; i++) {
+ 		Load256(px, sx);
+ 		Load256(py, sy);
+ 		ModSub256(dy, Gy + 4 * i, py);
+ 		_ModMult(_s, dy, dx[i]);
+ 		_ModSqr(_p2, _s);
+ 		ModSub256(px, _p2, px);
+ 		ModSub256(px, Gx + 4 * i);
+ 		ModSub256(py, Gx + 4 * i, px);
+ 		_ModMult(py, _s);
+ 		ModSub256(py, Gy + 4 * i);
+-		CHECK_PUB_SEARCH_MODE_MX(GRP_SIZE / 2 + (i + 1));
+-
+-		// REMOVED backward block (P - i*G):
+-		// Load256(px, sx);  ModSub256(dy, pyn, Gy + 4 * i);
+-		// _ModMult(_s, dy, dx[i]);  _ModSqr(_p2, _s);
+-		// ModSub256(px, _p2, px);   ModSub256(px, Gx + 4 * i);
+-		// ModSub256(py, px, Gx + 4 * i);
+-		// _ModMult(py, _s);         ModSub256(py, Gy + 4 * i, py);
+-		// CHECK_PUB_SEARCH_MODE_MX(GRP_SIZE / 2 - (i + 1));
++		CHECK_PUB_SEARCH_MODE_MX(i + 1);
+ 	}
+-	// REMOVED: first-point section
+-	i++;
++	i = GRP_SIZE;
+
+ 	// Next start point — unchanged
+@@ -762,14 +750,14 @@ __device__ void ComputeKeysSEARCH_MODE_SX(uint32_t mode, uint64_t* startx, uint
+ {
+
+-	uint64_t dx[GRP_SIZE / 2 + 1][4];
++	uint64_t dx[GRP_SIZE + 1][4];
+ 	uint64_t px[4];
+ 	uint64_t py[4];
+-	uint64_t pyn[4];
+ 	uint64_t sx[4];
+ 	uint64_t sy[4];
+ 	uint64_t dy[4];
+ 	uint64_t _s[4];
+ 	uint64_t _p2[4];
+
+@@ -780,43 +768,33 @@ __device__ void ComputeKeysSEARCH_MODE_SX(uint32_t mode, uint64_t* startx, uint
+ 	Load256(px, sx);
+ 	Load256(py, sy);
+
+ 	uint32_t i;
+-	for (i = 0; i < HSIZE; i++)
++	for (i = 0; i < GRP_SIZE; i++)
+ 		ModSub256(dx[i], Gx + 4 * i, sx);
+-	ModSub256(dx[i], Gx + 4 * i, sx);
+-	ModSub256(dx[i + 1], _2Gnx, sx);
++	ModSub256(dx[i], _2Gnx, sx);
+ 	_ModInvGrouped(dx);
+
+-	CHECK_PUB_SEARCH_MODE_SX(GRP_SIZE / 2);
+-	ModNeg256(pyn, py);
+-
+-	for (i = 0; i < HSIZE; i++) {
++	CHECK_PUB_SEARCH_MODE_SX(0);
++	for (i = 0; i < GRP_SIZE - 1; i++) {
+ 		Load256(px, sx);
+ 		Load256(py, sy);
+ 		ModSub256(dy, Gy + 4 * i, py);
+ 		_ModMult(_s, dy, dx[i]);
+ 		_ModSqr(_p2, _s);
+ 		ModSub256(px, _p2, px);
+ 		ModSub256(px, Gx + 4 * i);
+ 		ModSub256(py, Gx + 4 * i, px);
+ 		_ModMult(py, _s);
+ 		ModSub256(py, Gy + 4 * i);
+-		CHECK_PUB_SEARCH_MODE_SX(GRP_SIZE / 2 + (i + 1));
+-
+-		// REMOVED backward block (P - i*G):
+-		// Load256(px, sx);  ModSub256(dy, pyn, Gy + 4 * i);
+-		// _ModMult(_s, dy, dx[i]);  _ModSqr(_p2, _s);
+-		// ModSub256(px, _p2, px);   ModSub256(px, Gx + 4 * i);
+-		// ModSub256(py, px, Gx + 4 * i);
+-		// _ModMult(py, _s);         ModSub256(py, Gy + 4 * i, py);
+-		// CHECK_PUB_SEARCH_MODE_SX(GRP_SIZE / 2 - (i + 1));
++		CHECK_PUB_SEARCH_MODE_SX(i + 1);
+ 	}
+-	// REMOVED: first-point section
+-	i++;
++	i = GRP_SIZE;
+
+ 	// Next start point — unchanged
